@@ -439,6 +439,89 @@ def _history_fingerprint(path):
     return digest.hexdigest()
 
 
+def _normalize_codex_rollout(content):
+    """Normalize indexing metadata, preserving all other rollout bytes."""
+    lines = content.splitlines(keepends=True)
+    try:
+        header = json.loads(lines[0])
+        canonical_id = header.get('payload', {}).get('id')
+    except (ValueError, AttributeError, IndexError):
+        raise ValueError('Codex 历史文件格式无效；未迁移，请保留原记录后排查') from None
+    for index, line in enumerate(lines):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            # A trailing partial event must remain recoverable, byte for byte.
+            continue
+        if not isinstance(item, dict) or not isinstance(item.get('payload'), dict):
+            continue
+        payload = item['payload']
+        owner, field = None, None
+        if item.get('type') == 'session_meta' and payload.get('id') == canonical_id:
+            owner, field = payload, 'model_provider'
+        elif item.get('type') == 'event_msg' and payload.get('type') == 'thread_settings_applied':
+            # Codex reindexing reads these events regardless of their thread_id.
+            owner, field = payload.get('thread_settings'), 'model_provider_id'
+        if isinstance(owner, dict) and owner.get(field) == 'openai':
+            owner[field] = 'edge'
+            ending = line[len(line.rstrip(b'\r\n')):]
+            lines[index] = json.dumps(item, ensure_ascii=False).encode() + ending
+    return b''.join(lines)
+
+
+def _upgrade_codex_history_metadata(root, homes, shared, manifest):
+    """Repair v1's header-only rewrite offline; keep every attempt's snapshot."""
+    if manifest.get('metadata_version', 1) >= 2:
+        return
+    if codex_history_busy(homes):
+        raise ValueError('升级统一历史前，请关闭此工作环境的远程 VS Code 窗口及 Codex 终端，再重新同步；原记录未改动')
+    names = {'sessions', 'archived_sessions'} | {path.name for path in shared.glob('state_*.sqlite')}
+    fingerprints = {name: _history_fingerprint(shared / name) for name in names}
+    backup = root / ('codex-history-backup-v2-' + str(time.time_ns()))
+    backup.mkdir(mode=0o700)
+    with tempfile.TemporaryDirectory(prefix='history-metadata-stage-', dir=str(root)) as directory:
+        stage = Path(directory)
+        replacements = []
+        databases = []
+        for name in sorted(names):
+            source = shared / name
+            if not source.exists():
+                continue
+            snapshot = backup / name
+            if source.is_dir():
+                shutil.copytree(source, snapshot)
+                for path in sorted(snapshot.rglob('*.jsonl')):
+                    content = path.read_bytes()
+                    normalized = _normalize_codex_rollout(content)
+                    if normalized == content:
+                        continue
+                    relative = path.relative_to(backup)
+                    target = stage / relative
+                    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    target.write_bytes(normalized)
+                    target.chmod(0o600)
+                    replacements.append(relative)
+            else:
+                with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as db, closing(sqlite3.connect(snapshot)) as copy:
+                    db.backup(copy)
+                snapshot.chmod(0o600)
+                _merge_codex_history_db([snapshot], stage / name)
+                databases.append(name)
+        if codex_history_busy(homes) or any(_history_fingerprint(shared / name) != fingerprints[name] for name in names):
+            raise ValueError('升级期间 Codex 历史发生变化；原记录未替换，请关闭 Codex 后重试')
+        # Complete backup precedes the first replacement. Each file is atomic;
+        # an interrupted pass leaves the old marker so a retry repairs the rest.
+        for relative in replacements:
+            (stage / relative).replace(shared / relative)
+        for name in databases:
+            # A transaction keeps WAL frames attached to their database even
+            # if this process stops; do not swap a live SQLite file/sidecar pair.
+            with closing(sqlite3.connect(shared / name)) as db, db:
+                _normalize_codex_history_index(db)
+        manifest['metadata_version'] = 2
+        private_write(shared / 'ready-v1.json', json.dumps(manifest))
+
+
 def prepare_codex_history(root):
     """Share history, not credentials, inside one managed environment.
 
@@ -454,9 +537,11 @@ def prepare_codex_history(root):
         fcntl.flock(lock, fcntl.LOCK_EX)
         marker = shared / 'ready-v1.json'
         if marker.exists():
-            names = json.loads(marker.read_text())['entries']
+            manifest = json.loads(marker.read_text())
+            names = manifest['entries']
             if all((home / name).is_symlink() and (home / name).resolve() == (shared / name).resolve()
                    for home in homes for name in names):
+                _upgrade_codex_history_metadata(root, homes, shared, manifest)
                 return
         if codex_history_busy(homes):
             raise ValueError('首次统一 Codex 历史前，请关闭此工作环境的远程 VS Code 窗口及 Codex 终端，再重新同步；原记录未改动')
@@ -491,18 +576,8 @@ def prepare_codex_history(root):
                                     continue
                                 dest = target / path.relative_to(source)
                                 content = path.read_bytes()
-                                # Only the session metadata header owns the bucket.
-                                # Never rewrite message text, prompts or turn bodies.
                                 if path.suffix == '.jsonl':
-                                    header, sep, rest = content.partition(b'\n')
-                                    try:
-                                        meta = json.loads(header)
-                                        payload = meta.get('payload', {})
-                                        if meta.get('type') == 'session_meta' and payload.get('model_provider') in ('openai', 'edge'):
-                                            payload['model_provider'] = 'edge'
-                                            content = json.dumps(meta, ensure_ascii=False).encode() + sep + rest
-                                    except (ValueError, AttributeError):
-                                        raise ValueError('Codex 历史文件格式无效；未迁移，请保留原记录后排查') from None
+                                    content = _normalize_codex_rollout(content)
                                 if dest.exists() and dest.read_bytes() != content:
                                     raise ValueError('两个 Codex 历史目录存在同名不同内容的记录；未覆盖，请先处理冲突')
                                 dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -531,7 +606,7 @@ def prepare_codex_history(root):
                 if codex_history_busy(homes) or any(_history_fingerprint(home / name) != fingerprints[home.name][name]
                                                    for home in homes for name in names):
                     raise ValueError('迁移期间 Codex 历史发生变化；原记录未替换，请关闭 Codex 后重试')
-                private_write(stage / 'ready-v1.json', json.dumps(dict(entries=sorted(names), sources=fingerprints)))
+                private_write(stage / 'ready-v1.json', json.dumps(dict(entries=sorted(names), sources=fingerprints, metadata_version=2)))
                 stage.rename(shared)
         manifest = json.loads(marker.read_text())
         names = manifest['entries']
@@ -568,6 +643,7 @@ def prepare_codex_history(root):
                             dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                             sidecar.rename(dest)
                 path.symlink_to(target, target_is_directory=target.is_dir())
+        _upgrade_codex_history_metadata(root, homes, shared, manifest)
 
 
 def _merge_codex_history_db(sources, target):
@@ -659,19 +735,22 @@ def _merge_codex_history_db(sources, target):
                                 dest.execute('INSERT INTO ' + quoted + ' (' + fields + ') VALUES (' + ','.join('?' for _ in row) + ')', row)
                             except sqlite3.IntegrityError:
                                 raise ValueError('Codex 历史索引存在冲突；未迁移，请保留原数据后排查') from None
-        columns = {row[1] for row in dest.execute('PRAGMA table_info(threads)')}
-        if 'model_provider' in columns:
-            dest.execute("UPDATE threads SET model_provider='edge' WHERE model_provider='openai'")
-        # Some old rollouts were never indexed. Scan the united session tree
-        # again rather than retaining a completed scan of only the primary home.
-        backfill = {row[1] for row in dest.execute('PRAGMA table_info(backfill_state)')}
-        if {'status', 'last_watermark', 'last_success_at', 'updated_at'} <= backfill:
-            dest.execute("UPDATE backfill_state SET status='pending',last_watermark=NULL,last_success_at=NULL,updated_at=?", (int(time.time()),))
+        _normalize_codex_history_index(dest)
         if dest.execute('PRAGMA foreign_key_check').fetchone() is not None:
             raise ValueError('Codex 历史关联索引不完整；未迁移，请保留原数据后排查')
         dest.commit()
         if dest.execute('PRAGMA quick_check').fetchone() != ('ok',):
             raise ValueError('合并后的 Codex 历史索引检查失败；未替换原记录')
+
+
+def _normalize_codex_history_index(db):
+    columns = {row[1] for row in db.execute('PRAGMA table_info(threads)')}
+    if 'model_provider' in columns:
+        db.execute("UPDATE threads SET model_provider='edge' WHERE model_provider='openai'")
+    # Reindex the united tree, including rollouts missed by the previous home.
+    backfill = {row[1] for row in db.execute('PRAGMA table_info(backfill_state)')}
+    if {'status', 'last_watermark', 'last_success_at', 'updated_at'} <= backfill:
+        db.execute("UPDATE backfill_state SET status='pending',last_watermark=NULL,last_success_at=NULL,updated_at=?", (int(time.time()),))
 
 
 def configure(p):

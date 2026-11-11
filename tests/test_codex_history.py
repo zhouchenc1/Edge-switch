@@ -123,8 +123,209 @@ class CodexHistoryConfigTests(unittest.TestCase):
             self.assertEqual(prepare.call_count, 2)
 
 
+class CodexRolloutMetadataTests(unittest.TestCase):
+    def test_replayed_metadata_cannot_restore_the_old_provider(self):
+        records = [
+            dict(type='session_meta', payload=dict(id='current', model_provider='openai')),
+            dict(type='session_meta', payload=dict(id='ancestor', model_provider='openai')),
+            dict(type='session_meta', payload=dict(id='current', model_provider='openai')),
+            dict(type='event_msg', payload=dict(type='thread_settings_applied', thread_id='ancestor',
+                 thread_settings=dict(model_provider_id='openai', model='preserved-model'))),
+            dict(type='event_msg', payload=dict(type='thread_settings_applied',
+                 thread_settings=dict(model_provider_id='other-provider'))),
+            dict(type='event_msg', payload=dict(type='thread_settings_applied',
+                 thread_settings=dict(model_provider_id='openai'))),
+        ]
+        source = b'\n'.join(json.dumps(record).encode() for record in records)
+        normalized = remote_agent._normalize_codex_rollout(source)
+        actual = [json.loads(line) for line in normalized.splitlines()]
+        self.assertEqual([item['payload']['model_provider'] for item in actual[:3]],
+                         ['edge', 'openai', 'edge'])
+        self.assertEqual([item['payload']['thread_settings']['model_provider_id'] for item in actual[3:]],
+                         ['edge', 'other-provider', 'edge'])
+        self.assertEqual(actual[3]['payload']['thread_settings']['model'], 'preserved-model')
+        self.assertFalse(normalized.endswith(b'\n'))
+        self.assertEqual(remote_agent._normalize_codex_rollout(normalized), normalized)
+
+    def test_message_bytes_and_embedded_metadata_lookalikes_are_untouched(self):
+        header = b'{ "type" : "session_meta", "payload" : {"id":"current","model_provider":"edge"}}\r\n'
+        body = (
+            b'{ "type":"response_item", "payload":{"type":"message","model_provider":"openai",'
+            b'"nested":{"type":"session_meta","payload":{"id":"current","model_provider":"openai"}}}}\r\n'
+            b'{"type":"turn_context","payload":{"model_provider":"openai"}}\n'
+            b'{"type":"event_msg","payload":{"type":"user_message","thread_settings":{"model_provider_id":"openai"}}}\r\n'
+            b'{"type":"compacted","payload":{"message":"openai"}}\n'
+            b'{"type":"response_item","payload":{"text":"truncated'
+        )
+        self.assertEqual(remote_agent._normalize_codex_rollout(header + body), header + body)
+        changed_header = header.replace(b'"edge"', b'"openai"')
+        normalized = remote_agent._normalize_codex_rollout(changed_header + body)
+        first, separator, remaining = normalized.partition(b'\r\n')
+        self.assertEqual(separator, b'\r\n')
+        self.assertEqual(json.loads(first)['payload']['model_provider'], 'edge')
+        self.assertEqual(remaining, body)
+
+    def test_invalid_header_is_rejected_before_migration(self):
+        for content in (b'', b'not json\n', b'[]\n', b'{"type":"session_meta","payload":null}\n'):
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                remote_agent._normalize_codex_rollout(content)
+
+
 @unittest.skipUnless(os.name == 'posix', 'Remote migration requires Linux fcntl and symlinks')
 class CodexHistoryMigrationTests(unittest.TestCase):
+    def make_v1_history(self, root):
+        body = (b'{"type":"event_msg","payload":{"type":"thread_settings_applied",'
+                b'"thread_settings":{"model_provider_id":"openai"}}}\n'
+                b'{"type":"session_meta","payload":{"id":"official","model_provider":"openai"}}\n'
+                b'{ "type":"response_item", "payload":{"text":"keep openai exactly"}}\r\n')
+        original = session(root / 'codex-chatgpt-home/sessions/official.jsonl', 'edge', 'official', body)
+        archived = session(root / 'codex-chatgpt-home/archived_sessions/archived.jsonl', 'edge', 'archived', body)
+        with closing(database(root / 'codex-chatgpt-home/state_5.sqlite', 'official', 'openai')):
+            pass
+        with patch.object(remote_agent, 'codex_history_busy', return_value=False):
+            remote_agent.prepare_codex_history(root)
+        shared = root / 'codex-history'
+        (shared / 'sessions/official.jsonl').write_bytes(original)
+        (shared / 'archived_sessions/archived.jsonl').write_bytes(archived)
+        with closing(sqlite3.connect(shared / 'state_5.sqlite')) as db, db:
+            db.execute("UPDATE threads SET model_provider='openai'")
+        marker = shared / 'ready-v1.json'
+        manifest = json.loads(marker.read_text())
+        manifest.pop('metadata_version', None)
+        marker.write_text(json.dumps(manifest))
+        return shared, original, archived
+
+    def test_v1_metadata_upgrade_repairs_linked_history_and_keeps_complete_backups(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared, original, archived = self.make_v1_history(root)
+            with patch.object(remote_agent, 'codex_history_busy', return_value=False):
+                remote_agent.prepare_codex_history(root)
+            self.assertEqual((shared / 'sessions/official.jsonl').read_bytes(),
+                             remote_agent._normalize_codex_rollout(original))
+            self.assertEqual((shared / 'archived_sessions/archived.jsonl').read_bytes(),
+                             remote_agent._normalize_codex_rollout(archived))
+            self.assertEqual(json.loads((shared / 'ready-v1.json').read_text())['metadata_version'], 2)
+            with closing(sqlite3.connect(shared / 'state_5.sqlite')) as db:
+                self.assertEqual(db.execute('SELECT id,model_provider FROM threads').fetchall(), [('official', 'edge')])
+                self.assertEqual(db.execute('PRAGMA quick_check').fetchone(), ('ok',))
+            backups = list(root.glob('codex-history-backup-v2-*'))
+            self.assertTrue(backups)
+            self.assertTrue(any(path.read_bytes() == original for backup in backups for path in backup.rglob('official.jsonl')))
+            self.assertTrue(any(path.read_bytes() == archived for backup in backups for path in backup.rglob('archived.jsonl')))
+            db_backups = [path for backup in backups for path in backup.rglob('state_5.sqlite')]
+            self.assertTrue(db_backups)
+            with closing(sqlite3.connect(db_backups[0])) as db:
+                self.assertEqual(db.execute('SELECT id,model_provider FROM threads').fetchall(), [('official', 'openai')])
+            before = (shared / 'sessions/official.jsonl').read_bytes()
+            with patch.object(remote_agent, 'codex_history_busy', return_value=True):
+                remote_agent.prepare_codex_history(root)
+            self.assertEqual((shared / 'sessions/official.jsonl').read_bytes(), before)
+            self.assertEqual(list(root.glob('codex-history-backup-v2-*')), backups)
+
+    def test_v1_metadata_upgrade_refuses_active_process_without_changing_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared, original, archived = self.make_v1_history(root)
+            before = {path: path.read_bytes() for path in shared.rglob('*') if path.is_file()}
+            with patch.object(remote_agent, 'codex_history_busy', return_value=True):
+                with self.assertRaises(ValueError):
+                    remote_agent.prepare_codex_history(root)
+            self.assertEqual({path: path.read_bytes() for path in shared.rglob('*') if path.is_file()}, before)
+            self.assertFalse(list(root.glob('codex-history-backup-v2-*')))
+
+    def test_interrupted_v1_metadata_upgrade_keeps_backups_and_can_resume(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared, original, archived = self.make_v1_history(root)
+            replace = Path.replace
+            interrupted = []
+
+            def fail_after_first_rollout(path, target):
+                result = replace(path, target)
+                if Path(target).suffix == '.jsonl' and shared in Path(target).parents and not interrupted:
+                    interrupted.append(target)
+                    raise OSError('simulated interruption after one rollout publication')
+                return result
+
+            with patch.object(remote_agent, 'codex_history_busy', return_value=False):
+                with patch.object(Path, 'replace', fail_after_first_rollout):
+                    with self.assertRaises(OSError):
+                        remote_agent.prepare_codex_history(root)
+                self.assertTrue(interrupted)
+                self.assertNotEqual(json.loads((shared / 'ready-v1.json').read_text()).get('metadata_version'), 2)
+                backups = list(root.glob('codex-history-backup-v2-*'))
+                self.assertTrue(any(path.read_bytes() == original for backup in backups for path in backup.rglob('official.jsonl')))
+                self.assertTrue(any(path.read_bytes() == archived for backup in backups for path in backup.rglob('archived.jsonl')))
+                remote_agent.prepare_codex_history(root)
+            self.assertEqual(json.loads((shared / 'ready-v1.json').read_text())['metadata_version'], 2)
+            self.assertEqual((shared / 'sessions/official.jsonl').read_bytes(), remote_agent._normalize_codex_rollout(original))
+            self.assertEqual((shared / 'archived_sessions/archived.jsonl').read_bytes(), remote_agent._normalize_codex_rollout(archived))
+            with closing(sqlite3.connect(shared / 'state_5.sqlite')) as db:
+                self.assertEqual(db.execute('SELECT id,model_provider FROM threads').fetchall(), [('official', 'edge')])
+
+    def test_v1_metadata_upgrade_retains_wal_only_rows_and_their_backup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared, _, _ = self.make_v1_history(root)
+            path = shared / 'state_5.sqlite'
+            with closing(sqlite3.connect(path)) as writer:
+                writer.execute('PRAGMA journal_mode=WAL')
+                writer.execute('PRAGMA wal_autocheckpoint=0')
+                main_before = path.read_bytes()
+                writer.execute('INSERT INTO threads VALUES (?, ?, ?)', ('wal-only', 'openai', 'WAL title'))
+                writer.commit()
+                self.assertEqual(path.read_bytes(), main_before)
+                self.assertGreater(path.with_name(path.name + '-wal').stat().st_size, 32)
+                with patch.object(remote_agent, 'codex_history_busy', return_value=False):
+                    remote_agent.prepare_codex_history(root)
+                self.assertEqual(writer.execute('SELECT id,model_provider FROM threads ORDER BY id').fetchall(),
+                                 [('official', 'edge'), ('wal-only', 'edge')])
+                backups = [path for backup in root.glob('codex-history-backup-v2-*')
+                           for path in backup.rglob('state_5.sqlite')]
+                self.assertTrue(backups)
+                with closing(sqlite3.connect(backups[0])) as db:
+                    self.assertEqual(db.execute('SELECT id,model_provider FROM threads ORDER BY id').fetchall(),
+                                     [('official', 'openai'), ('wal-only', 'openai')])
+            with closing(sqlite3.connect(path)) as db:
+                self.assertEqual(db.execute('PRAGMA quick_check').fetchone(), ('ok',))
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM threads').fetchone()[0], 2)
+
+    def test_v1_database_transaction_failure_rolls_back_and_retry_preserves_wal_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared, original, archived = self.make_v1_history(root)
+            path = shared / 'state_5.sqlite'
+            normalize = remote_agent._normalize_codex_history_index
+            failures = []
+
+            def fail_during_live_transaction(db):
+                normalize(db)
+                main = Path(db.execute('PRAGMA database_list').fetchone()[2])
+                if main == path:
+                    failures.append(main)
+                    raise OSError('simulated interruption before database commit')
+
+            with closing(sqlite3.connect(path)) as writer:
+                writer.execute('PRAGMA journal_mode=WAL')
+                writer.execute('PRAGMA wal_autocheckpoint=0')
+                writer.execute('INSERT INTO threads VALUES (?, ?, ?)', ('wal-only', 'openai', 'WAL title'))
+                writer.commit()
+                with patch.object(remote_agent, 'codex_history_busy', return_value=False):
+                    with patch.object(remote_agent, '_normalize_codex_history_index', fail_during_live_transaction):
+                        with self.assertRaises(OSError):
+                            remote_agent.prepare_codex_history(root)
+                    self.assertEqual(failures, [path])
+                    self.assertEqual(writer.execute('SELECT id,model_provider FROM threads ORDER BY id').fetchall(),
+                                     [('official', 'openai'), ('wal-only', 'openai')])
+                    self.assertNotEqual(json.loads((shared / 'ready-v1.json').read_text()).get('metadata_version'), 2)
+                    remote_agent.prepare_codex_history(root)
+                self.assertEqual(writer.execute('SELECT id,model_provider FROM threads ORDER BY id').fetchall(),
+                                 [('official', 'edge'), ('wal-only', 'edge')])
+            self.assertEqual(json.loads((shared / 'ready-v1.json').read_text())['metadata_version'], 2)
+            self.assertEqual((shared / 'sessions/official.jsonl').read_bytes(), remote_agent._normalize_codex_rollout(original))
+            self.assertEqual((shared / 'archived_sessions/archived.jsonl').read_bytes(), remote_agent._normalize_codex_rollout(archived))
+
     def test_unifies_live_archived_and_text_history_preserving_bodies_auth_and_originals(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
