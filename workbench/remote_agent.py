@@ -571,30 +571,50 @@ def prepare_codex_history(root):
 
 
 def _merge_codex_history_db(sources, target):
-    """Merge compatible indexes including tool metadata; never silently drop rows."""
+    """Import older compatible indexes into the newest schema without downgrading."""
     def schema(db):
         return dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
 
+    def migrations(db, tables):
+        if '_sqlx_migrations' not in tables:
+            return []
+        return list(db.execute('SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version'))
+
+    def quote(name):
+        return '"' + name.replace('"', '""') + '"'
+
+    # The API CLI and the VS Code bundled CLI can legitimately be different
+    # releases. Pick the most advanced migration lineage before importing rows.
+    inventory = []
+    for source in sources:
+        with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as db:
+            tables = schema(db)
+            versions = migrations(db, tables)
+            if any(not row[2] for row in versions):
+                raise ValueError('Codex 历史库有未成功完成的数据库升级；原记录未替换')
+            inventory.append((source, tables, versions))
+    inventory.sort(key=lambda item: (len(item[2]), len(item[1])), reverse=True)
     with closing(sqlite3.connect(target)) as dest:
         baseline = None
-        for source in sources:
+        baseline_versions = []
+        for source, tables, versions in inventory:
             with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as src:
                 if src.execute('PRAGMA quick_check').fetchone() != ('ok',):
                     raise ValueError('Codex 历史数据库损坏；未迁移，请先保留原文件后排查')
-                tables = schema(src)
                 if not tables:
                     continue
                 if baseline is None:
                     src.backup(dest)
                     baseline = tables
+                    baseline_versions = versions
                     continue
-                if tables != baseline:
-                    raise ValueError('两个 Codex 历史数据库版本不同；请先统一两种模式的 Codex 版本后重试')
-                if '_sqlx_migrations' in tables:
-                    # Installation timestamps differ between two valid homes.
-                    migrations = 'SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version'
-                    if list(src.execute(migrations)) != list(dest.execute(migrations)):
-                        raise ValueError('两个 Codex 历史数据库迁移版本不同；未替换原记录')
+                if versions or baseline_versions:
+                    # Prefix versions, checksums and success flags must match.
+                    # A newer schema may add nullable/default columns and tables.
+                    if not versions or versions != baseline_versions[:len(versions)]:
+                        raise ValueError('两个 Codex 历史库不属于兼容的数据库升级链；原记录未替换')
+                elif tables != baseline:
+                    raise ValueError('Codex 历史库结构不同且缺少升级记录，无法确认兼容；原记录未替换')
                 # Imports happen in a private stage with foreign_keys off (SQLite
                 # default); validate all relationships once every table is merged.
                 for table in tables:
@@ -605,7 +625,7 @@ def _merge_codex_history_db(sources, target):
                         # account enrollment, not conversations. Keep primary
                         # state; each complete source DB remains backed up.
                         continue
-                    quoted = '"' + table.replace('"', '""') + '"'
+                    quoted = quote(table)
                     if table not in ('threads', 'thread_dynamic_tools', 'thread_spawn_edges', 'thread_sections',
                                      'thread_section_appearance', 'projects', 'project_roots', 'project_idempotency_keys',
                                      'thread_attachments', 'thread_artifacts', 'guardian_review_feedback',
@@ -616,7 +636,16 @@ def _merge_codex_history_db(sources, target):
                     info = list(src.execute('PRAGMA table_info(' + quoted + ')'))
                     columns = [row[1] for row in info]
                     primary = [i for i, row in enumerate(info) if row[5]]
-                    fields = ','.join('"' + name.replace('"', '""') + '"' for name in columns)
+                    target_info = list(dest.execute('PRAGMA table_info(' + quoted + ')'))
+                    target_columns = {row[1]: row for row in target_info}
+                    if any(name not in target_columns for name in columns):
+                        raise ValueError('新版 Codex 历史库缺少旧数据字段，无法无损导入；原记录未替换')
+                    if any(row[1] not in columns and row[3] and row[4] is None for row in target_info):
+                        raise ValueError('新版 Codex 历史库新增必填字段且无默认值；原记录未替换')
+                    if any(row[2].upper() != target_columns[row[1]][2].upper() or row[5] != target_columns[row[1]][5]
+                           for row in info):
+                        raise ValueError('Codex 历史字段类型或主键不兼容；原记录未替换')
+                    fields = ','.join(quote(name) for name in columns)
                     for row in src.execute('SELECT ' + fields + ' FROM ' + quoted):
                         predicates = primary or list(range(len(columns)))
                         where = ' AND '.join('"' + columns[i].replace('"', '""') + '" IS ?' for i in predicates)

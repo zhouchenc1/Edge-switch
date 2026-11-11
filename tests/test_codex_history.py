@@ -1,5 +1,6 @@
 """History survives managed Codex account/provider switches on Linux boards."""
 import json
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -33,6 +34,65 @@ def database(path, ident, provider, with_tools=False):
 
 
 class CodexHistoryConfigTests(unittest.TestCase):
+    def test_failed_migration_in_only_source_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'source.sqlite'
+            with closing(sqlite3.connect(source)) as db, db:
+                db.execute('CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, checksum BLOB, success BOOLEAN)')
+                db.execute('INSERT INTO _sqlx_migrations VALUES (62, ?, 0)', (b'incomplete',))
+            original = source.read_bytes()
+            with self.assertRaisesRegex(ValueError, '未成功完成'):
+                remote_agent._merge_codex_history_db([source], root / 'merged.sqlite')
+            self.assertEqual(source.read_bytes(), original)
+
+    def test_older_migration_prefix_imports_into_newer_schema_in_either_order(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                paths = [root / 'old.sqlite', root / 'new.sqlite']
+                for index, path in enumerate(paths):
+                    with closing(sqlite3.connect(path)) as db, db:
+                        db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, title TEXT)')
+                        db.execute('CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, checksum BLOB, success BOOLEAN)')
+                        db.execute('INSERT INTO _sqlx_migrations VALUES (59, ?, 1)', (b'common',))
+                        if index:
+                            db.execute('ALTER TABLE threads ADD COLUMN attached_thread_parent_id TEXT')
+                            db.execute("ALTER TABLE threads ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
+                            db.execute('CREATE TABLE thread_read_receipts (thread_id TEXT PRIMARY KEY REFERENCES threads(id), read_at INTEGER)')
+                            db.execute('INSERT INTO _sqlx_migrations VALUES (62, ?, 1)', (b'newer',))
+                        db.execute('INSERT INTO threads (id,model_provider,title) VALUES (?, ?, ?)',
+                                   ('new' if index else 'old', 'openai' if index else 'edge', 'fixture'))
+                        if index:
+                            db.execute('INSERT INTO thread_read_receipts VALUES (?, ?)', ('new', 123))
+                dest = root / 'merged.sqlite'
+                remote_agent._merge_codex_history_db(list(reversed(paths)) if reverse else paths, dest)
+                with closing(sqlite3.connect(dest)) as db:
+                    self.assertEqual(db.execute('SELECT id,model_provider,is_pinned,attached_thread_parent_id FROM threads ORDER BY id').fetchall(),
+                                     [('new', 'edge', 0, None), ('old', 'edge', 0, None)])
+                    self.assertEqual(db.execute('SELECT * FROM thread_read_receipts').fetchall(), [('new', 123)])
+                    self.assertEqual(db.execute('SELECT MAX(version) FROM _sqlx_migrations').fetchone()[0], 62)
+
+    def test_incompatible_checksums_or_required_columns_keep_source_databases(self):
+        for invalid in ('checksum', 'required_column', 'removed_column'):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                paths = [root / 'old.sqlite', root / 'new.sqlite']
+                for index, path in enumerate(paths):
+                    with closing(sqlite3.connect(path)) as db, db:
+                        db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT)')
+                        db.execute('CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, checksum BLOB, success BOOLEAN)')
+                        db.execute('INSERT INTO _sqlx_migrations VALUES (59, ?, 1)',
+                                   (b'different' if index and invalid == 'checksum' else b'common',))
+                        if index:
+                            db.execute('INSERT INTO _sqlx_migrations VALUES (62, ?, 1)', (b'newer',))
+                        if (index and invalid == 'required_column') or (not index and invalid == 'removed_column'):
+                            db.execute('ALTER TABLE threads ADD COLUMN extra TEXT NOT NULL')
+                before = [path.read_bytes() for path in paths]
+                with self.assertRaises(ValueError):
+                    remote_agent._merge_codex_history_db(paths, root / 'merged.sqlite')
+                self.assertEqual([path.read_bytes() for path in paths], before)
+
     def test_api_and_official_use_one_history_bucket_and_database_without_sharing_auth(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
