@@ -51,6 +51,14 @@ Harness 多供应商设置要求 **0.2.2 或更新版本**。当前适配器不�
 
 Harness 通过独立 `--patch` 配置多供应商适配器和默认模型，不覆盖用户的 `settings.yaml`、home patch 和现有会话。OpenCode 使用独立配置文件与数据目录，Gemini 使用 `GEMINI_CLI_HOME`，Claude 使用 `CLAUDE_CONFIG_DIR`。模型卡片的“删除”删除本地记录和本地密钥；已有板卡文件保留。
 
+### Codex 账号切换与聊天记录
+
+同一 Linux 用户、同一 Edge Switch 工作环境内，远程 VS Code 的 Codex 插件和受管 Codex 终端共享聊天历史。官方账号、API 供应商使用固定的 `edge` 历史标识；切换服务时，已有会话仍可出现在历史列表中。两个认证目录继续分别保存官方 OAuth 与 API Key，不共用认证文件，不扫描其他工作环境或用户原有的 `~/.codex`。
+
+升级后首次点击“同步到板卡”或打开 Codex 时，会合并该工作环境原有 `codex-home` 与 `codex-chatgpt-home` 的会话、归档和历史索引，写入 `codex-history`；`sqlite_home` 固定指向此目录，新版索引也沿用同一位置。原数据保留在同级 `codex-history-backup-v1`。只调整会话头部与索引中的供应商标识，消息正文保留。
+
+首次迁移前需要关闭该工作环境的远程 VS Code 窗口及 Codex 终端，然后重新同步并打开。若原数据存在冲突、数据库版本不同或迁移中断后原目录继续产生记录，应用会停止处理并保留数据，不能通过删除备份强行重试。迁移完成后，切换服务并重新打开 Codex 即可读取同一历史；继续旧会话时，请先确认当前供应商，因为后续上下文将发送给当前选定的服务。
+
 ## 参考与验证范围
 
 品牌图标来自 [LobeHub Icons](https://lobehub.com/zh/icons)，以本地 SVG 随应用打包，授权与固定来源版本记录在 [图标目录](../image/providers/README.md)。

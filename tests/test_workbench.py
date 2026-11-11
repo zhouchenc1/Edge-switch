@@ -145,6 +145,7 @@ class RemoteTests(unittest.TestCase):
             bundled.chmod(0o700)
             (bundled.parent.parent.parent / 'package.json').write_text(json.dumps(dict(publisher='openai', name='chatgpt', version='1.0.0')))
             with patch.object(remote_agent.platform, 'machine', return_value='aarch64'), \
+                    patch.object(remote_agent, 'prepare_codex_history'), \
                     patch.object(remote_agent, 'command', side_effect=['features', 'Logged in using an API key']):
                 result = remote_agent.configure_ide(p)
             self.assertEqual(result['auth'], 'API Key')
@@ -229,7 +230,8 @@ class RemoteTests(unittest.TestCase):
             current = root / 'tools/codex/current.json'
             current.parent.mkdir(parents=True)
             current.write_text('{"binary":"test-codex"}')
-            with patch.object(remote_agent, 'command', return_value='features'):
+            with patch.object(remote_agent, 'prepare_codex_history'), \
+                    patch.object(remote_agent, 'command', return_value='features'):
                 remote_agent.configure(p)
             self.assertEqual(shared.read_text(), 'original-shared-config')
             self.assertFalse((home / '.bashrc').exists())

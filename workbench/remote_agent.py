@@ -1,5 +1,6 @@
 """Uploaded over SSH stdin; Python 3.8+, no third-party dependencies."""
 import hashlib
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -397,6 +399,252 @@ def install_tool(p):
     return dict(tool=tool, version=result)
 
 
+def codex_history_busy(homes):
+    """Migration is offline: do not rewrite files owned by an active app-server."""
+    wanted = {str(home.resolve()) for home in homes}
+    for process in Path('/proc').glob('[0-9]*'):
+        try:
+            if process.name == str(os.getpid()):
+                continue
+            values = (process / 'environ').read_bytes().split(b'\0')
+            if any(value.startswith(b'CODEX_HOME=') and str(Path(os.fsdecode(value[11:])).resolve()) in wanted for value in values):
+                return True
+        except PermissionError:
+            # Do not assume a matching but unreadable process is idle.
+            try:
+                if (process / 'status').stat().st_uid == os.getuid() and 'codex' in (process / 'comm').read_text().lower():
+                    return True
+            except OSError:
+                pass
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _history_fingerprint(path):
+    if not path.exists():
+        return None
+    digest = hashlib.sha256()
+    files = sorted(p for p in path.rglob('*') if p.is_file()) if path.is_dir() else [path]
+    wal = path.with_name(path.name + '-wal')
+    # Merely opening a WAL-mode DB can create an empty/header-only sidecar.
+    # Actual frames must participate in drift detection, including uncheckpointed commits.
+    if path.suffix == '.sqlite' and wal.exists() and wal.stat().st_size > 32:
+        files.append(wal)
+    for file in files:
+        digest.update(str(file.relative_to(path) if path.is_dir() else file.name).encode())
+        with file.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def prepare_codex_history(root):
+    """Share history, not credentials, inside one managed environment.
+
+    Originals stay in a permanent backup. A staged union is published only
+    after validation; reruns can finish linking after an interrupted migration.
+    Both configs also set sqlite_home here, so future DB versions share storage.
+    """
+    import fcntl
+    homes = [root / 'codex-home', root / 'codex-chatgpt-home']
+    shared = root / 'codex-history'
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (root / 'codex-history.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        marker = shared / 'ready-v1.json'
+        if marker.exists():
+            names = json.loads(marker.read_text())['entries']
+            if all((home / name).is_symlink() and (home / name).resolve() == (shared / name).resolve()
+                   for home in homes for name in names):
+                return
+        if codex_history_busy(homes):
+            raise ValueError('首次统一 Codex 历史前，请关闭此工作环境的远程 VS Code 窗口及 Codex 终端，再重新同步；原记录未改动')
+        backup = root / 'codex-history-backup-v1'
+        if not marker.exists():
+            # Work only on copies. No auth, config or other environment is read.
+            with tempfile.TemporaryDirectory(prefix='history-stage-', dir=str(root)) as directory:
+                stage = Path(directory)
+                names = {'sessions', 'archived_sessions', 'history.jsonl', 'session_index.jsonl'}
+                for home in homes:
+                    names.update(path.name for path in home.glob('state_*.sqlite'))
+                fingerprints = {home.name: {name: _history_fingerprint(home / name)
+                                           for name in names} for home in homes}
+                for name in sorted(names):
+                    sources = [home / name for home in homes if (home / name).exists()]
+                    target = stage / name
+                    if name.endswith('.sqlite'):
+                        _merge_codex_history_db(sources, target)
+                    elif name.endswith('.jsonl'):
+                        seen = set()
+                        with target.open('wb') as output:
+                            for source in sources:
+                                for line in source.read_bytes().splitlines():
+                                    if line and line not in seen:
+                                        output.write(line + b'\n')
+                                        seen.add(line)
+                    else:
+                        target.mkdir(mode=0o700)
+                        for source in sources:
+                            for path in source.rglob('*'):
+                                if not path.is_file():
+                                    continue
+                                dest = target / path.relative_to(source)
+                                content = path.read_bytes()
+                                # Only the session metadata header owns the bucket.
+                                # Never rewrite message text, prompts or turn bodies.
+                                if path.suffix == '.jsonl':
+                                    header, sep, rest = content.partition(b'\n')
+                                    try:
+                                        meta = json.loads(header)
+                                        payload = meta.get('payload', {})
+                                        if meta.get('type') == 'session_meta' and payload.get('model_provider') in ('openai', 'edge'):
+                                            payload['model_provider'] = 'edge'
+                                            content = json.dumps(meta, ensure_ascii=False).encode() + sep + rest
+                                    except (ValueError, AttributeError):
+                                        raise ValueError('Codex 历史文件格式无效；未迁移，请保留原记录后排查') from None
+                                if dest.exists() and dest.read_bytes() != content:
+                                    raise ValueError('两个 Codex 历史目录存在同名不同内容的记录；未覆盖，请先处理冲突')
+                                dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                                dest.write_bytes(content)
+                                dest.chmod(0o600)
+                    if target.is_file():
+                        target.chmod(0o600)
+                # Snapshot even WAL-backed databases using SQLite's backup API.
+                for home in homes:
+                    for name in names:
+                        source = home / name
+                        dest = backup / home.name / name
+                        if not source.exists() or dest.exists():
+                            continue
+                        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        if name.endswith('.sqlite'):
+                            with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as db, closing(sqlite3.connect(dest)) as copy:
+                                db.backup(copy)
+                        elif source.is_dir():
+                            shutil.copytree(source, dest)
+                        else:
+                            shutil.copy2(source, dest)
+                        if dest.is_file():
+                            dest.chmod(0o600)
+                # A race or interrupted previous run must never hide new data.
+                if codex_history_busy(homes) or any(_history_fingerprint(home / name) != fingerprints[home.name][name]
+                                                   for home in homes for name in names):
+                    raise ValueError('迁移期间 Codex 历史发生变化；原记录未替换，请关闭 Codex 后重试')
+                private_write(stage / 'ready-v1.json', json.dumps(dict(entries=sorted(names), sources=fingerprints)))
+                stage.rename(shared)
+        manifest = json.loads(marker.read_text())
+        names = manifest['entries']
+        # Validate every unlinked original before moving any of them on retry.
+        for home in homes:
+            for name in names:
+                path = home / name
+                if path.is_symlink() and path.resolve() == (shared / name).resolve():
+                    continue
+                original = backup / 'originals' / home.name / name
+                source = path if path.exists() else original
+                if _history_fingerprint(source) != manifest['sources'][home.name][name]:
+                    raise ValueError('未完成迁移的原历史已变化；未覆盖，请保留 codex-history 与 codex-history-backup-v1 后排查')
+        for home in homes:
+            home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for name in names:
+                path = home / name
+                target = shared / name
+                if path.is_symlink() and path.resolve() == target.resolve():
+                    continue
+                if path.exists() or path.is_symlink():
+                    # Keep the actual originals as well as the preflight snapshot.
+                    original = backup / 'originals' / home.name / name
+                    original.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    if original.exists():
+                        raise ValueError('历史迁移备份已存在；未覆盖，请检查未完成的迁移')
+                    path.rename(original)
+                # A stale sidecar must not be attached to the new shared DB.
+                if name.endswith('.sqlite'):
+                    for suffix in ('-wal', '-shm', '-journal'):
+                        sidecar = home / (name + suffix)
+                        if sidecar.exists():
+                            dest = backup / 'originals' / home.name / sidecar.name
+                            dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                            sidecar.rename(dest)
+                path.symlink_to(target, target_is_directory=target.is_dir())
+
+
+def _merge_codex_history_db(sources, target):
+    """Merge compatible indexes including tool metadata; never silently drop rows."""
+    def schema(db):
+        return dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+
+    with closing(sqlite3.connect(target)) as dest:
+        baseline = None
+        for source in sources:
+            with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as src:
+                if src.execute('PRAGMA quick_check').fetchone() != ('ok',):
+                    raise ValueError('Codex 历史数据库损坏；未迁移，请先保留原文件后排查')
+                tables = schema(src)
+                if not tables:
+                    continue
+                if baseline is None:
+                    src.backup(dest)
+                    baseline = tables
+                    continue
+                if tables != baseline:
+                    raise ValueError('两个 Codex 历史数据库版本不同；请先统一两种模式的 Codex 版本后重试')
+                if '_sqlx_migrations' in tables:
+                    # Installation timestamps differ between two valid homes.
+                    migrations = 'SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version'
+                    if list(src.execute(migrations)) != list(dest.execute(migrations)):
+                        raise ValueError('两个 Codex 历史数据库迁移版本不同；未替换原记录')
+                # Imports happen in a private stage with foreign_keys off (SQLite
+                # default); validate all relationships once every table is merged.
+                for table in tables:
+                    if table in ('_sqlx_migrations', 'backfill_state', 'rollout_migration_state',
+                                 'rollout_migration_skipped_rollouts', 'remote_control_enrollments',
+                                 'external_agent_config_imports', 'logs'):
+                        # These describe this DB instance's background work or
+                        # account enrollment, not conversations. Keep primary
+                        # state; each complete source DB remains backed up.
+                        continue
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    if table not in ('threads', 'thread_dynamic_tools', 'thread_spawn_edges', 'thread_sections',
+                                     'thread_section_appearance', 'projects', 'project_roots', 'project_idempotency_keys',
+                                     'thread_attachments', 'thread_artifacts', 'guardian_review_feedback',
+                                     'thread_read_receipts', 'stage1_outputs', 'agent_jobs', 'agent_job_items'):
+                        if src.execute('SELECT 1 FROM ' + quoted + ' LIMIT 1').fetchone():
+                            raise ValueError('Codex 历史数据库包含尚未支持的数据表；未迁移，请保留原记录后更新 Edge Switch')
+                        continue
+                    info = list(src.execute('PRAGMA table_info(' + quoted + ')'))
+                    columns = [row[1] for row in info]
+                    primary = [i for i, row in enumerate(info) if row[5]]
+                    fields = ','.join('"' + name.replace('"', '""') + '"' for name in columns)
+                    for row in src.execute('SELECT ' + fields + ' FROM ' + quoted):
+                        predicates = primary or list(range(len(columns)))
+                        where = ' AND '.join('"' + columns[i].replace('"', '""') + '" IS ?' for i in predicates)
+                        previous = dest.execute('SELECT ' + fields + ' FROM ' + quoted + ' WHERE ' + where,
+                                                tuple(row[i] for i in predicates)).fetchone()
+                        if previous is not None:
+                            if previous != row:
+                                raise ValueError('两个 Codex 历史数据库存在同编号不同内容的数据；未覆盖，请先处理冲突')
+                        else:
+                            try:
+                                dest.execute('INSERT INTO ' + quoted + ' (' + fields + ') VALUES (' + ','.join('?' for _ in row) + ')', row)
+                            except sqlite3.IntegrityError:
+                                raise ValueError('Codex 历史索引存在冲突；未迁移，请保留原数据后排查') from None
+        columns = {row[1] for row in dest.execute('PRAGMA table_info(threads)')}
+        if 'model_provider' in columns:
+            dest.execute("UPDATE threads SET model_provider='edge' WHERE model_provider='openai'")
+        # Some old rollouts were never indexed. Scan the united session tree
+        # again rather than retaining a completed scan of only the primary home.
+        backfill = {row[1] for row in dest.execute('PRAGMA table_info(backfill_state)')}
+        if {'status', 'last_watermark', 'last_success_at', 'updated_at'} <= backfill:
+            dest.execute("UPDATE backfill_state SET status='pending',last_watermark=NULL,last_success_at=NULL,updated_at=?", (int(time.time()),))
+        if dest.execute('PRAGMA foreign_key_check').fetchone() is not None:
+            raise ValueError('Codex 历史关联索引不完整；未迁移，请保留原数据后排查')
+        dest.commit()
+        if dest.execute('PRAGMA quick_check').fetchone() != ('ok',):
+            raise ValueError('合并后的 Codex 历史索引检查失败；未替换原记录')
+
+
 def configure(p):
     if p.get('reuse') and p.get('auth_mode') != 'chatgpt':
         p = reuse_credentials(p)
@@ -416,7 +664,9 @@ def configure(p):
               '\n[model_providers.edge]\nname = "Edge Workbench"\nbase_url = ' +
               json.dumps(p.get('base_url', '')) + '\nwire_api = "responses"\nenv_key = "OPENAI_API_KEY"\n')
     if official:
-        config = 'forced_login_method = "chatgpt"\ncli_auth_credentials_store = "file"\n'
+        config = ('forced_login_method = "chatgpt"\ncli_auth_credentials_store = "file"\nmodel_provider = "edge"\n'
+                  '[model_providers.edge]\nname = "OpenAI"\nrequires_openai_auth = true\nsupports_websockets = true\nwire_api = "responses"\n')
+    config = 'sqlite_home = ' + json.dumps(str(root / 'codex-history')) + '\n' + config
     current = json.loads((root / 'tools/codex/current.json').read_text())
     # Parse with the installed CLI before committing a profile, without making a model request.
     with tempfile.TemporaryDirectory(prefix='config-check-', dir=str(root)) as directory:
@@ -424,6 +674,7 @@ def configure(p):
         env = tool_env(p, root)
         env.update(CODEX_HOME=directory, OPENAI_API_KEY='configuration-check-only')
         command([current['binary'], 'features', 'list'], env=env, timeout=25)
+    prepare_codex_history(root)
     private_write(codex_home / 'config.toml', config)
     if not official:
         private_write(codex_home / 'auth.json', json.dumps({'OPENAI_API_KEY': p['key']}))

@@ -48,7 +48,8 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           if ($tag -ne "v$version") { throw 'Tag does not match source version' }
       - name: Build installer and portable archive
-        run: npm run desktop:build
+        shell: pwsh
+        run: ./scripts/build-desktop.ps1
       - name: Exercise packaged desktop through WebView2
         run: npm run test:desktop
       - uses: actions/upload-artifact@v4

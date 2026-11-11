@@ -217,9 +217,10 @@ class Board:
         service = (ROOT / 'workbench/harness_service.py').read_bytes()
         source = b'SERVICE_SOURCE = ' + repr(service).encode('ascii') + b'\n' + source
         # Source is fixed; API credentials travel through encrypted SSH stdin only.
-        code = 'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(%r)),"edge-agent","exec"))' % base64.b64encode(zlib.compress(source)).decode()
+        # Keep the expanding remote agent off Windows' bounded command line.
+        code = 'import base64,zlib,sys;exec(compile(zlib.decompress(base64.b64decode(sys.stdin.buffer.readline())),"edge-agent","exec"))'
         command = 'python3 -c ' + shlex.quote(code)
-        data = json.dumps(dict(payload, action=action, scope=self.scope)).encode()
+        data = base64.b64encode(zlib.compress(source)) + b'\n' + json.dumps(dict(payload, action=action, scope=self.scope)).encode()
         p = subprocess.run([*self.ssh(), command], input=data, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, timeout=timeout, creationflags=CREATE_NO_WINDOW)
         try:

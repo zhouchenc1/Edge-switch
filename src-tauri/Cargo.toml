@@ -1,6 +1,6 @@
 [package]
 name = "edge-switch"
-version = "2.0.0-alpha.6"
+version = "2.0.0-alpha.7"
 description = "Edge Switch remote AI workbench"
 edition = "2021"
 license = "AGPL-3.0-only"

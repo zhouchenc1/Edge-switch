@@ -1,5 +1,7 @@
 """Per-tool routing, migration and owned connection lifecycle regression checks."""
 import subprocess
+import shlex
+import sys
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
@@ -56,6 +58,20 @@ class LifecycleTests(unittest.TestCase):
         self.assertLess(len(subprocess.list2cmdline(args)), 30000)
         self.assertNotIn('private-test-marker', str(args))
         self.assertIn(b'private-test-marker', run.call_args.kwargs['input'])
+
+    def test_stdin_agent_bootstrap_executes_without_consuming_json_payload(self):
+        board = core.Board(core.Profile(), 'invalid-scope')
+        execute = subprocess.run
+
+        def local_remote(args, **kwargs):
+            # Execute the exact remote bootstrap against an invalid scope. It
+            # must read the following JSON and reject it before writing files.
+            command = shlex.split(args[-1])
+            return execute([sys.executable, *command[1:]], **kwargs)
+
+        with patch.object(core.subprocess, 'run', side_effect=local_remote):
+            with self.assertRaisesRegex(RuntimeError, 'Invalid workspace ID'):
+                board.call('prepare')
 
 
 if __name__ == '__main__':
